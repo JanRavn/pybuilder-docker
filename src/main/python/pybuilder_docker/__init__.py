@@ -156,52 +156,60 @@ def do_docker_push(project, logger):
     generate_artifact_manifest(project, registry_path)
 
 
-def generate_artifact_manifest(project, registry_path):
-    artifact_manifest = {'artifact-type': 'container', 'artifact-path': registry_path,
-                         'artifact-identifier': project.version}
-    with open(project.expand_path('$dir_target', 'artifact.json'), 'w') as target:
+def generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
+    artifact_path = project.expand_path('$dir_target', 'artifact.json')
+    with open(artifact_path, 'w') as target:
+        artifact_manifest = {
+            'artifact-type': 'container',
+            'artifact-path': registry_path,
+            'artifact-identifier': project.version,
+        }
         json.dump(artifact_manifest, target)
 
 
-def _run_tag_cmd(project, local_img, remote_img, logger):
-    logger.info("Tagging local docker image {} - {}".format(local_img, remote_img))
+# docker tag ${APPLICATION}/${ROLE} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
+# docker tag ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
+def _run_tag_cmd(project: Project, logger: Logger, reactor: Reactor, local_img: str, remote_img: str) -> None:
     report_dir = prepare_reports_directory(project)
-    command = ExternalCommandBuilder('docker', project)
+
+    command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('tag')
     command.use_argument('{0}').formatted_with(local_img)
     command.use_argument('{0}').formatted_with(remote_img)
-    command.run("{}/{}".format(report_dir, 'docker_push_tag'))
+    logger.info("Tagging local docker image {} - {}".format(local_img, remote_img))
+    result = command.run(f"{report_dir}/docker_push_tag")
+    if result.exit_code > 0:
+        logger.info(result.error_report_lines)
+
+        raise Exception(f"Error tagging image to remote registry - {remote_img}")
 
 
-def _run_push_cmd(project, remote_img, logger):
-    logger.info("Pushing remote docker image - {}".format(remote_img))
-    report_dir = prepare_reports_directory(project)
-    command = ExternalCommandBuilder('docker', project)
-    command.use_argument('push')
-    command.use_argument('{0}').formatted_with(remote_img)
-    res = command.run("{}/{}".format(report_dir, 'docker_push_tag'))
-    if res.exit_code > 0:
-        logger.info(res.error_report_lines)
-        raise Exception("Error pushing image to remote registry - {}".format(remote_img))
-
-
-#
-# docker tag ${APPLICATION}/${ROLE} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
-# docker tag ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
+def _run_push_cmd(project: Project, logger: Logger, reactor: Reactor, remote_img: str) -> None:
+    report_dir = prepare_reports_directory(project)
 
-def copy_dist_file(project, dist_dir, logger):
-    dist_file = get_dist_file(project=project)
+    command = ExternalCommandBuilder('docker', project, reactor)
+    command.use_argument('push')
+    command.use_argument('{0}').formatted_with(remote_img)
+    logger.info("Pushing remote docker image - {}".format(remote_img))
+    result = command.run(f"{report_dir}/docker_push_tag")
+    if result.exit_code > 0:
+        logger.info(result.error_report_lines)
+
+        raise Exception(f"Error pushing image to remote registry - {remote_img}")
+
+
+def copy_dist_file(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
+    dist_file = get_dist_file(project)
     dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
     shutil.copy2(dist_file_path, dist_dir)
 
 
-def write_docker_build_file(project, logger, build_image, dist_dir):
+def write_docker_build_file(project: Project, logger: Logger, reactor: Reactor, build_image: str, dist_dir: str):
     setup_script = os.path.join(dist_dir, "Dockerfile")
     with open(setup_script, "w") as setup_file:
         setup_file.write(render_docker_buildfile(project, build_image))
-
     os.chmod(setup_script, 0o755)
 
 

@@ -58,49 +58,25 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
     reactor.pybuilder_venv.verify_can_execute(
         command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
 
-    temp_build_img = f"pyb-temp-{project.name}:{project.version}"
     build_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
+    dist_dir = project.expand_path("$dir_dist/docker")
+    if not os.path.exists(dist_dir):
+        os.mkdir(dist_dir)
 
     # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
     _exec_cmd(
         project, logger, reactor,
         'docker', 'build',
         '--build-arg', f'buildVersion={project.get_property("docker_package_build_version")}',
-        '-t', temp_build_img, project.get_property('docker_package_build_dir'),
+        '-t', f"pyb-temp-{project.name}:{project.version}", project.get_property('docker_package_build_dir'),
         message=f"Executing primary stage docker build for image - {build_img}.",
         error="Error building primary stage docker image",
         report_file="docker_package_build",
         verbose_property="docker_package_build",
         force_log=True,
     )
-
-    dist_dir = project.expand_path("$dir_dist/docker")
-    if not os.path.exists(dist_dir):
-        os.mkdir(dist_dir)
-
-    setup_script = os.path.join(dist_dir, "Dockerfile")
-    with open(setup_script, "w") as setup_file:
-        maintainer = project.get_property("docker_package_image_maintainer", "anonymous"),
-        dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
-        prepare_env_cmd = project.get_property(
-            "docker_package_prepare_env_cmd",
-            "echo 'empty prepare_env_cmd installing into python'",
-        ),
-        package_cmd = project.get_property(
-            "docker_package_package_cmd",
-            f"pip install {dist_file}",
-        )
-        setup_file.write(f"FROM {temp_build_img}\n"
-                         f"MAINTAINER {maintainer}\n"
-                         f"COPY ${dist_file} .\n"
-                         f"RUN ${prepare_env_cmd}\n"
-                         f"RUN ${package_cmd}\n")
-    os.chmod(setup_script, 0o755)
-
-    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
-    dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
-    shutil.copy2(dist_file_path, dist_dir)
-
+    _handle_dockerfile(project, logger, reactor, dist_dir)
+    _handle_copy(project, logger, reactor, dist_dir)
     _exec_cmd(
         project, logger, reactor,
         'docker', 'build', '-t', build_img, dist_dir,
@@ -110,8 +86,29 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
         verbose_property="docker_package_verbose_output",
         force_log=True,
     )
-
     logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
+
+
+def _handle_dockerfile(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
+    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
+    prepare_env_cmd = project.get_property("docker_package_prepare_env_cmd",
+                                           "echo 'empty prepare_env_cmd installing into python'"),
+    package_cmd = project.get_property("docker_package_package_cmd", f"pip install {dist_file}")
+
+    setup_script = os.path.join(dist_dir, "Dockerfile")
+    with open(setup_script, "w") as setup_file:
+        setup_file.write(f"FROM pyb-temp-{project.name}:{project.version}\n"
+                         f"MAINTAINER {project.get_property('docker_package_image_maintainer', 'anonymous')}\n"
+                         f"COPY ${dist_file} .\n"
+                         f"RUN ${prepare_env_cmd}\n"
+                         f"RUN ${package_cmd}\n")
+    os.chmod(setup_script, 0o755)
+
+
+def _handle_copy(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
+    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
+    dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
+    shutil.copy2(dist_file_path, dist_dir)
 
 
 @task(description="Publish artifact into a docker registry.")
@@ -121,20 +118,21 @@ def docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
 
 
 def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
-    # True if user set verbose in build.py or from command line
-    verbose = project.get_property("verbose")
-    project.set_property_if_unset("docker_push_verbose_output", verbose)
+    project.set_property_if_unset("docker_push_verbose_output", project.get_property("verbose"))
 
     registry = project.get_mandatory_property("docker_push_registry")
     local_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
     fq_artifact = project.get_property("docker_push_img", local_img)
     registry_path = f"{registry}/{fq_artifact}"
 
-    # aws ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken'
-    #     | base64 -D
-    #     | cut -d: -f2
-    # docker login -u AWS -p <my_decoded_password> -e <any_email_address>
-    #     <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
+    _handle_ecr(project, logger, reactor, registry, fq_artifact)
+    _handle_tags(project, logger, reactor, local_img)
+    _handle_artifact(project, logger, reactor, registry_path)
+
+
+# aws ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken'|base64 -D|cut -d: -f2
+# docker login -u AWS -p <my_decoded_password> -e <any_email_address> <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
+def _handle_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str, fq_artifact: str) -> None:
     if "ecr" in registry:
         result = _exec_cmd(
             project, logger, reactor,
@@ -167,15 +165,39 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
                     verbose_property="docker_package_verbose_output",
                 )
 
+
+# docker tag ${APPLICATION}/${ROLE} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
+# docker tag ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
+#
+# docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
+# docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
+def _handle_tags(project: Project, logger: Logger, reactor: Reactor, local_img: str) -> None:
     tags = [project.version]
     tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
     if tag_as_latest:
         tags.append('latest')
     for tag in tags:
         remote_img = f"{project.name}:{tag}"
-        _run_tag_cmd(project, logger, reactor, local_img, remote_img)
-        _run_push_cmd(project, logger, reactor, remote_img)
+        _exec_cmd(
+            project, logger, reactor,
+            'docker', 'tag', local_img, remote_img,
+            message=f"Tagging local docker image {local_img} - {remote_img}",
+            error=f"Error tagging image to remote registry - {remote_img}",
+            report_file='docker_push_tag',
+            verbose_property="docker_package_verbose_output",
+        )
+        _exec_cmd(
+            project, logger, reactor,
+            'docker', 'push', remote_img,
+            message=f"Pushing remote docker image - {remote_img}",
+            error=f"Error pushing image to remote registry - {remote_img}",
+            report_file="docker_push_tag",
+            verbose_property="docker_package_verbose_output",
+            force_log=True,
+        )
 
+
+def _handle_artifact(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
     artifact_path = project.expand_path('$dir_target', 'artifact.json')
     with open(artifact_path, 'w') as target:
         artifact_manifest = {
@@ -183,31 +205,4 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
             'artifact-path': registry_path,
             'artifact-identifier': project.version,
         }
-        json.dump(artifact_manifest, target)
-
-
-# docker tag ${APPLICATION}/${ROLE} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
-# docker tag ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
-def _run_tag_cmd(project: Project, logger: Logger, reactor: Reactor, local_img: str, remote_img: str) -> None:
-    _exec_cmd(
-        project, logger, reactor,
-        'docker', 'tag', local_img, remote_img,
-        message=f"Tagging local docker image {local_img} - {remote_img}",
-        error=f"Error tagging image to remote registry - {remote_img}",
-        report_file='docker_push_tag',
-        verbose_property="docker_package_verbose_output",
-    )
-
-
-# docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
-# docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
-def _run_push_cmd(project: Project, logger: Logger, reactor: Reactor, remote_img: str) -> None:
-    _exec_cmd(
-        project, logger, reactor,
-        'docker', 'push', remote_img,
-        message=f"Pushing remote docker image - {remote_img}",
-        error=f"Error pushing image to remote registry - {remote_img}",
-        report_file="docker_push_tag",
-        verbose_property="docker_package_verbose_output",
-        force_log=True,
-    )
+        json.dump(artifact_manifest, target, indent=4)

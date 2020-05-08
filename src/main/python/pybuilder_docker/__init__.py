@@ -101,7 +101,7 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     if tag_as_latest:
         tags.append('latest')
     for tag in tags:
-        remote_img = f"{registry_path}:{tag}"
+        remote_img = f"{project.name}:{tag}"
         _run_tag_cmd(project, logger, reactor, local_img, remote_img)
         _run_push_cmd(project, logger, reactor, remote_img)
 

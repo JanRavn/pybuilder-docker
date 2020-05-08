@@ -207,7 +207,7 @@ def _docker_tag_and_push_image(project: Project, logger: Logger, reactor: Reacto
 
 
 def _generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
-    artifact_path = project.expand_path('$dir_target', 'artifact.json')
+    artifact_path = project.expand_path(_make_folder(project, '$dir_target'), 'artifact.json')
     with open(artifact_path, 'w') as target:
         artifact_manifest = {
             'artifact-type': 'container',

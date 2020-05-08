@@ -1,4 +1,4 @@
-**N.B.:** This is a fork of [pybuilder-docker](https://github.com/AlienVault-Engineering/pybuilder-docker) which, as far as I know, is not maintained anymore. Code refactored and minor tweaks.  
+**N.B.:** This is a fork of [pybuilder-docker](https://github.com/AlienVault-Engineering/pybuilder-docker) which, as far as I know, is not maintained anymore. Code refactored and minor tweaks. Thanks to **[hbrunch](https://github.com/hbruch)** for the documentation (contributed to the original project but never merged).  
 
 # pybuilder-docker
 

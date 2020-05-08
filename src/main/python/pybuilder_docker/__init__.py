@@ -20,9 +20,7 @@ def _exec_cmd(
         message: str = None, error: str = None, report_file: str = None,
         verbose_property: str = None, force_log: bool = False,
 ) -> Optional[ExternalCommandResult]:
-    report_folder = project.expand_path("$dir_reports/docker")
-    if not os.path.exists(report_folder):
-        os.mkdir(report_folder)
+    report_folder = _make_folder(project, "$dir_reports", "docker")
     report_file = report_file or "_".join([program, *arguments])
 
     command = ExternalCommandBuilder(program, project, reactor)
@@ -42,6 +40,14 @@ def _exec_cmd(
         raise Exception(error)
 
 
+def _make_folder(project: Project, *path: str) -> str:
+    folder = project.expand_path(*path)
+    if not os.path.exists(folder):
+        os.mkdir(folder)
+
+    return folder
+
+
 @task(description="Package artifact into a docker container.")
 @depends("publish")
 def docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
@@ -58,12 +64,14 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
     reactor.pybuilder_venv.verify_can_execute(
         command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
 
+    dist_dir = _make_folder(project, "$dir_dist", "docker")
     build_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
-    dist_dir = project.expand_path("$dir_dist/docker")
-    if not os.path.exists(dist_dir):
-        os.mkdir(dist_dir)
+    _docker_build_stages(project, logger, reactor, dist_dir, build_img)
+    logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
 
-    # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
+
+# docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
+def _docker_build_stages(project: Project, logger: Logger, reactor: Reactor, dist_dir: str, build_img: str) -> None:
     _exec_cmd(
         project, logger, reactor,
         'docker', 'build',
@@ -75,8 +83,8 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
         verbose_property="docker_package_build",
         force_log=True,
     )
-    _handle_dockerfile(project, logger, reactor, dist_dir)
-    _handle_copy(project, logger, reactor, dist_dir)
+    _generate_dockerfile(project, logger, reactor, dist_dir)
+    _copy_dist_package(project, logger, reactor, dist_dir)
     _exec_cmd(
         project, logger, reactor,
         'docker', 'build', '-t', build_img, dist_dir,
@@ -86,10 +94,9 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
         verbose_property="docker_package_verbose_output",
         force_log=True,
     )
-    logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
 
 
-def _handle_dockerfile(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
+def _generate_dockerfile(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
     dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
     prepare_env_cmd = project.get_property("docker_package_prepare_env_cmd",
                                            "echo 'empty prepare_env_cmd installing into python'"),
@@ -105,19 +112,21 @@ def _handle_dockerfile(project: Project, logger: Logger, reactor: Reactor, dist_
     os.chmod(setup_script, 0o755)
 
 
-def _handle_copy(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
-    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
-    dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
+def _copy_dist_package(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
+    dist_file_path = project.expand_path(
+        _make_folder(project, "$dir_dist", 'dist'),
+        project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
+    )
     shutil.copy2(dist_file_path, dist_dir)
 
 
 @task(description="Publish artifact into a docker registry.")
 @depends("docker_package")
 def docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
-    do_docker_push(project, logger, reactor)
+    _do_docker_push(project, logger, reactor)
 
 
-def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
+def _do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_push_verbose_output", project.get_property("verbose"))
 
     registry = project.get_mandatory_property("docker_push_registry")
@@ -125,14 +134,14 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     fq_artifact = project.get_property("docker_push_img", local_img)
     registry_path = f"{registry}/{fq_artifact}"
 
-    _handle_ecr(project, logger, reactor, registry, fq_artifact)
-    _handle_tags(project, logger, reactor, local_img)
-    _handle_artifact(project, logger, reactor, registry_path)
+    _docker_login_aws_ecr(project, logger, reactor, registry, fq_artifact)
+    _docker_tag_and_push_image(project, logger, reactor, local_img)
+    _generate_artifact_manifest(project, logger, reactor, registry_path)
 
 
 # aws ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken'|base64 -D|cut -d: -f2
 # docker login -u AWS -p <my_decoded_password> -e <any_email_address> <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
-def _handle_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str, fq_artifact: str) -> None:
+def _docker_login_aws_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str, fq_artifact: str) -> None:
     if "ecr" in registry:
         result = _exec_cmd(
             project, logger, reactor,
@@ -171,7 +180,7 @@ def _handle_ecr(project: Project, logger: Logger, reactor: Reactor, registry: st
 #
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
-def _handle_tags(project: Project, logger: Logger, reactor: Reactor, local_img: str) -> None:
+def _docker_tag_and_push_image(project: Project, logger: Logger, reactor: Reactor, local_img: str) -> None:
     tags = [project.version]
     tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
     if tag_as_latest:
@@ -197,7 +206,7 @@ def _handle_tags(project: Project, logger: Logger, reactor: Reactor, local_img: 
         )
 
 
-def _handle_artifact(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
+def _generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
     artifact_path = project.expand_path('$dir_target', 'artifact.json')
     with open(artifact_path, 'w') as target:
         artifact_manifest = {

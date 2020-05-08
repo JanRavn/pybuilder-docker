@@ -12,15 +12,6 @@ from pybuilder.pluginhelper.external_command import ExternalCommandBuilder
 from pybuilder.reactor import Reactor
 
 
-# DOCKER_IMAGE_TEMPLATE = string.Template("""
-# FROM ${build_image}
-# MAINTAINER ${maintainer_name}
-# COPY ${dist_file} .
-# RUN ${prepare_env_cmd}
-# RUN ${package_cmd}
-# """)
-
-
 @task(description="Package artifact into a docker container.")
 @depends("publish")
 def docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
@@ -33,9 +24,6 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
     project.set_property_if_unset("docker_package_build_image", project.name)
     project.set_property_if_unset("docker_package_build_version", project.version)
 
-    report_dir = prepare_reports_directory(project)  # TODO check
-    dist_dir = prepare_dist_directory(project)  # TODO check
-
     reactor.pybuilder_venv.verify_can_execute(
         command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
 
@@ -43,9 +31,10 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
     verbose = project.get_property("verbose")
     project.set_property_if_unset("docker_package_verbose_output", verbose)
 
-    temp_build_img = 'pyb-temp-{}:{}'.format(project.name, project.version)  # TODO fix-f
-    build_img = get_build_img(project)  # TODO check
-    logger.info("Executing primary stage docker build for image - {}.".format(build_img))  # TODO fix-f
+    report_dir = prepare_directory("$dir_reports", project)
+
+    temp_build_img = f"pyb-temp-{project.name}:{project.version}"
+    build_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
 
     # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
     command = ExternalCommandBuilder('docker', project, reactor)
@@ -55,33 +44,43 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
     command.use_argument('-t')
     command.use_argument('{0}').formatted_with(temp_build_img)
     command.use_argument('{0}').formatted_with_property('docker_package_build_dir')
-    result = command.run("{}/{}".format(report_dir, 'docker_package_build'))  # TODO fix-f
+    logger.info(f"Executing primary stage docker build for image - {build_img}.")
+    result = command.run(f"{report_dir}/docker_package_build")
     if result.exit_code != 0:
-        logger.error(result.error_report_lines)
+        logger.error(result.error_report_lines)  # TODO verbose?
+
         raise Exception("Error building primary stage docker image")
-    write_docker_build_file(project=project, logger=logger, build_image=temp_build_img, dist_dir=dist_dir)
-    copy_dist_file(project=project, dist_dir=dist_dir, logger=logger)
-    logger.info("Executing secondary stage docker build for image - {}.".format(build_img))  # TODO fix-f
-    command = ExternalCommandBuilder('docker', project)
+
+    dist_dir = prepare_directory("$dir_dist", project)
+
+    setup_script = os.path.join(dist_dir, "Dockerfile")
+    with open(setup_script, "w") as setup_file:
+        setup_file.write(render_docker_buildfile(project, temp_build_img))
+    os.chmod(setup_script, 0o755)
+
+    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
+    dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
+    shutil.copy2(dist_file_path, dist_dir)
+
+    command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('build')
     command.use_argument('-t')
     command.use_argument('{0}').formatted_with(build_img)
     command.use_argument('{0}').formatted_with(dist_dir)
-    result = command.run("{}/{}".format(report_dir, 'docker_package_img'))  # TODO fix-f
+    logger.info(f"Executing secondary stage docker build for image - {build_img}.")
+    result = command.run(f"{report_dir}/docker_package_img")
     if result.exit_code != 0:
         logger.error(result.error_report_lines)
+
         raise Exception("Error building docker image")
-    logger.info("Finished build docker image - {} - with dist file - {}".format(build_img, dist_dir))  # TODO fix-f
 
-
-def get_build_img(project):
-    return project.get_property('docker_package_build_img', '{}:{}'.format(project.name, project.version))  # TODO fix-f
+    logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
 
 
 @task(description="Publish artifact into a docker registry.")
 @depends("docker_package")
-def docker_push(project, logger):
-    do_docker_push(project, logger)
+def docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
+    do_docker_push(project, logger, reactor)
 
 
 def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
@@ -90,14 +89,12 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_push_verbose_output", verbose)
 
     registry = project.get_mandatory_property("docker_push_registry")
-
-    fq_artifact = project.get_property("docker_push_img", get_build_img(project))
-    if "ecr" in registry:
-        _prep_ecr(project=project, fq_artifact=fq_artifact, registry=registry)
-
-    local_img = get_build_img(project)
-
+    local_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
+    fq_artifact = project.get_property("docker_push_img", local_img)
     registry_path = f"{registry}/{fq_artifact}"
+
+    if "ecr" in registry:
+        _prep_ecr(project, logger, reactor, registry, fq_artifact)
 
     tags = [project.version]
     tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
@@ -108,7 +105,14 @@ def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
         _run_tag_cmd(project, logger, reactor, local_img, remote_img)
         _run_push_cmd(project, logger, reactor, remote_img)
 
-    generate_artifact_manifest(project, logger, reactor, registry_path)
+    artifact_path = project.expand_path('$dir_target', 'artifact.json')
+    with open(artifact_path, 'w') as target:
+        artifact_manifest = {
+            'artifact-type': 'container',
+            'artifact-path': registry_path,
+            'artifact-identifier': project.version,
+        }
+        json.dump(artifact_manifest, target)
 
 
 def _prep_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str, fq_artifact: str) -> None:
@@ -123,6 +127,8 @@ def _prep_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str,
 #     | cut -d: -f2
 # docker login -u AWS -p <my_decoded_password> -e <any_email_address> <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
 def _ecr_login(project: Project, logger: Logger, reactor: Reactor, registry: str) -> None:
+    reports_dir = prepare_directory("$dir_reports", project)
+
     command = ExternalCommandBuilder('aws', project, reactor)
     command.use_argument('ecr')
     command.use_argument('get-authorization-token')
@@ -130,7 +136,7 @@ def _ecr_login(project: Project, logger: Logger, reactor: Reactor, registry: str
     command.use_argument('text')
     command.use_argument('--query')
     command.use_argument('authorizationData[].authorizationToken')
-    result = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_get_token'))
+    result = command.run(f"{reports_dir}/docker_ecr_get_token")
     if result.exit_code > 0:
         logger.info(result.error_report_lines)  # TODO verbose?
 
@@ -145,7 +151,7 @@ def _ecr_login(project: Project, logger: Logger, reactor: Reactor, registry: str
     command.use_argument('-p')
     command.use_argument('{0}').formatted_with(password)
     command.use_argument('{0}').formatted_with(registry)
-    result = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_docker_login'))
+    result = command.run(f"{reports_dir}/docker_ecr_docker_login")
     if result.exit_code > 0:
         logger.info(result.error_report_lines)  # TODO verbose?
 
@@ -153,7 +159,7 @@ def _ecr_login(project: Project, logger: Logger, reactor: Reactor, registry: str
 
 
 def _create_ecr_registry(project: Project, logger: Logger, reactor: Reactor, fq_artifact: str) -> None:
-    reports_dir = prepare_reports_directory(project)
+    reports_dir = prepare_directory("$dir_reports", project)
 
     command = ExternalCommandBuilder('aws', project, reactor)
     command.use_argument('ecr')
@@ -174,21 +180,10 @@ def _create_ecr_registry(project: Project, logger: Logger, reactor: Reactor, fq_
             raise Exception("Unable to create ecr registry")
 
 
-def generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
-    artifact_path = project.expand_path('$dir_target', 'artifact.json')
-    with open(artifact_path, 'w') as target:
-        artifact_manifest = {
-            'artifact-type': 'container',
-            'artifact-path': registry_path,
-            'artifact-identifier': project.version,
-        }
-        json.dump(artifact_manifest, target)
-
-
 # docker tag ${APPLICATION}/${ROLE} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
 # docker tag ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER} ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
 def _run_tag_cmd(project: Project, logger: Logger, reactor: Reactor, local_img: str, remote_img: str) -> None:
-    report_dir = prepare_reports_directory(project)
+    report_dir = prepare_directory("$dir_reports", project)
 
     command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('tag')
@@ -205,7 +200,7 @@ def _run_tag_cmd(project: Project, logger: Logger, reactor: Reactor, local_img: 
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:latest
 # docker push ${DOCKER_REGISTRY}/${APPLICATION}/${ROLE}:${BUILD_NUMBER}
 def _run_push_cmd(project: Project, logger: Logger, reactor: Reactor, remote_img: str) -> None:
-    report_dir = prepare_reports_directory(project)
+    report_dir = prepare_directory("$dir_reports", project)
 
     command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('push')
@@ -218,22 +213,9 @@ def _run_push_cmd(project: Project, logger: Logger, reactor: Reactor, remote_img
         raise Exception(f"Error pushing image to remote registry - {remote_img}")
 
 
-def copy_dist_file(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
-    dist_file = get_dist_file(project)
-    dist_file_path = project.expand_path("$dir_dist", 'dist', dist_file)
-    shutil.copy2(dist_file_path, dist_dir)
-
-
-def write_docker_build_file(project: Project, logger: Logger, reactor: Reactor, build_image: str, dist_dir: str):
-    setup_script = os.path.join(dist_dir, "Dockerfile")
-    with open(setup_script, "w") as setup_file:
-        setup_file.write(render_docker_buildfile(project, build_image))
-    os.chmod(setup_script, 0o755)
-
-
 def render_docker_buildfile(project: Project, build_image: str) -> str:
     maintainer = project.get_property("docker_package_image_maintainer", "anonymous"),
-    dist_file = get_dist_file(project)
+    dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
     prepare_env_cmd = project.get_property(
         "docker_package_prepare_env_cmd",
         "echo 'empty prepare_env_cmd installing into python'",
@@ -248,20 +230,6 @@ def render_docker_buildfile(project: Project, build_image: str) -> str:
            f"COPY ${dist_file} .\n" \
            f"RUN ${prepare_env_cmd}\n" \
            f"RUN ${package_cmd}\n"
-
-
-def get_dist_file(project: Project) -> bool:
-    default_dist_file = f"{project.name}-{project.version}.tar.gz"
-
-    return project.get_property("docker_package_dist_file", default_dist_file)
-
-
-def prepare_reports_directory(project: Project) -> str:
-    return prepare_directory("$dir_reports", project)
-
-
-def prepare_dist_directory(project: Project) -> str:
-    return prepare_directory("$dir_dist", project)
 
 
 def prepare_directory(dir_variable: str, project: Project) -> str:

@@ -11,12 +11,16 @@ use_plugin("python.distutils")
 author = "stefano-bragaglia"
 home_page = "https://github.com/stefano-bragaglia/pybuilder-docker"
 url = "https://github.com/stefano-bragaglia/pybuilder-docker"
+
 name = "pybuilder-docker"
 description = "A pybuilder plugin that stages a python package into a docker container " \
               "and optionally publishes it to a registry."
 summary = "A pybuilder plugin that stages a python package into a docker container " \
           "and optionally publishes it to a registry."
+version = "0.1.0"
 license = "Apache 2.0"
+
+
 default_task = "publish"
 
 

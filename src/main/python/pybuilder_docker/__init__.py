@@ -1,74 +1,81 @@
 import base64
 import json
 import os
-import random
 import shutil
-import string
 
-from pybuilder.core import Logger, Project, depends, after
+from pybuilder.core import after
+from pybuilder.core import depends
+from pybuilder.core import Logger
+from pybuilder.core import Project
 from pybuilder.core import task
 from pybuilder.pluginhelper.external_command import ExternalCommandBuilder
-from pybuilder.utils import assert_can_execute
+from pybuilder.reactor import Reactor
 
-DOCKER_IMAGE_TEMPLATE = string.Template("""
-FROM ${build_image}
-MAINTAINER ${maintainer_name}
-COPY ${dist_file} .
-RUN ${prepare_env_cmd}
-RUN ${package_cmd}
-""")
+
+# DOCKER_IMAGE_TEMPLATE = string.Template("""
+# FROM ${build_image}
+# MAINTAINER ${maintainer_name}
+# COPY ${dist_file} .
+# RUN ${prepare_env_cmd}
+# RUN ${package_cmd}
+# """)
 
 
 @task(description="Package artifact into a docker container.")
 @depends("publish")
-def docker_package(project, logger):
-    # type: (Project, Logger) -> None
-    do_docker_package(project, logger)
+def docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
+    do_docker_package(project, logger, reactor)
 
 
 @after("publish")
-def do_docker_package(project, logger):
+def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_package_build_dir", "src/main/docker")
     project.set_property_if_unset("docker_package_build_image", project.name)
     project.set_property_if_unset("docker_package_build_version", project.version)
-    report_dir = prepare_reports_directory(project)
-    dist_dir = prepare_dist_directory(project)
-    assert_can_execute(["docker", "--version"], prerequisite="docker", caller="docker_package")
-    # is true if user set verbose in build.py or from command line
+
+    report_dir = prepare_reports_directory(project)  # TODO check
+    dist_dir = prepare_dist_directory(project)  # TODO check
+
+    reactor.pybuilder_venv.verify_can_execute(
+        command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
+
+    # True if user set verbose in build.py or from command line
     verbose = project.get_property("verbose")
     project.set_property_if_unset("docker_package_verbose_output", verbose)
-    temp_build_img = 'pyb-temp-{}:{}'.format(project.name, project.version)
-    build_img = get_build_img(project)
-    logger.info("Executing primary stage docker build for image - {}.".format(build_img))
+
+    temp_build_img = 'pyb-temp-{}:{}'.format(project.name, project.version)  # TODO fix-f
+    build_img = get_build_img(project)  # TODO check
+    logger.info("Executing primary stage docker build for image - {}.".format(build_img))  # TODO fix-f
+
     # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
-    command = ExternalCommandBuilder('docker', project)
+    command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('build')
     command.use_argument('--build-arg')
     command.use_argument('buildVersion={0}').formatted_with_property('docker_package_build_version')
     command.use_argument('-t')
     command.use_argument('{0}').formatted_with(temp_build_img)
     command.use_argument('{0}').formatted_with_property('docker_package_build_dir')
-    result = command.run("{}/{}".format(report_dir, 'docker_package_build'))
-    if result.exit_code !=0:
+    result = command.run("{}/{}".format(report_dir, 'docker_package_build'))  # TODO fix-f
+    if result.exit_code != 0:
         logger.error(result.error_report_lines)
         raise Exception("Error building primary stage docker image")
     write_docker_build_file(project=project, logger=logger, build_image=temp_build_img, dist_dir=dist_dir)
     copy_dist_file(project=project, dist_dir=dist_dir, logger=logger)
-    logger.info("Executing secondary stage docker build for image - {}.".format(build_img))
+    logger.info("Executing secondary stage docker build for image - {}.".format(build_img))  # TODO fix-f
     command = ExternalCommandBuilder('docker', project)
     command.use_argument('build')
     command.use_argument('-t')
     command.use_argument('{0}').formatted_with(build_img)
     command.use_argument('{0}').formatted_with(dist_dir)
-    result = command.run("{}/{}".format(report_dir, 'docker_package_img'))
-    if result.exit_code !=0:
+    result = command.run("{}/{}".format(report_dir, 'docker_package_img'))  # TODO fix-f
+    if result.exit_code != 0:
         logger.error(result.error_report_lines)
         raise Exception("Error building docker image")
-    logger.info("Finished build docker image - {} - with dist file - {}".format(build_img, dist_dir))
+    logger.info("Finished build docker image - {} - with dist file - {}".format(build_img, dist_dir))  # TODO fix-f
 
 
 def get_build_img(project):
-    return project.get_property('docker_package_build_img', '{}:{}'.format(project.name, project.version))
+    return project.get_property('docker_package_build_img', '{}:{}'.format(project.name, project.version))  # TODO fix-f
 
 
 @task(description="Publish artifact into a docker registry.")
@@ -136,14 +143,14 @@ def do_docker_push(project, logger):
     tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
     registry = project.get_mandatory_property("docker_push_registry")
     local_img = get_build_img(project)
-    fq_artifact = project.get_property("docker_push_img",get_build_img(project))
+    fq_artifact = project.get_property("docker_push_img", get_build_img(project))
     if "ecr" in registry:
         _prep_ecr(project=project, fq_artifact=fq_artifact, registry=registry)
-    registry_path =  "{registry}/{fq_artifact}".format(registry=registry, fq_artifact=fq_artifact,)
+    registry_path = "{registry}/{fq_artifact}".format(registry=registry, fq_artifact=fq_artifact, )
     tags = [project.version]
     if tag_as_latest: tags.append('latest')
     for tag in tags:
-        remote_img = "{registry_path}:{version}".format(registry_path=registry_path,version=tag)
+        remote_img = "{registry_path}:{version}".format(registry_path=registry_path, version=tag)
         _run_tag_cmd(project, local_img, remote_img, logger)
         _run_push_cmd(project=project, remote_img=remote_img, logger=logger)
     generate_artifact_manifest(project, registry_path)
@@ -173,7 +180,7 @@ def _run_push_cmd(project, remote_img, logger):
     command.use_argument('push')
     command.use_argument('{0}').formatted_with(remote_img)
     res = command.run("{}/{}".format(report_dir, 'docker_push_tag'))
-    if res.exit_code >0:
+    if res.exit_code > 0:
         logger.info(res.error_report_lines)
         raise Exception("Error pushing image to remote registry - {}".format(remote_img))
 
@@ -198,44 +205,43 @@ def write_docker_build_file(project, logger, build_image, dist_dir):
     os.chmod(setup_script, 0o755)
 
 
-def render_docker_buildfile(project, build_image):
-    # type: (Project, str) -> str
-
+def render_docker_buildfile(project: Project, build_image: str) -> str:
+    maintainer = project.get_property("docker_package_image_maintainer", "anonymous"),
     dist_file = get_dist_file(project)
-    default_package_cmd = "pip install {}".format(dist_file)
-    template_values = {
-        "build_image": build_image,
-        "dist_file": dist_file,
-        "maintainer_name": project.get_property("docker_package_image_maintainer",
-                                                        "anonymous"),
-        "prepare_env_cmd": project.get_property("docker_package_prepare_env_cmd",
-                                                "echo 'empty prepare_env_cmd installing into python'"),
-        "package_cmd": project.get_property("docker_package_package_cmd", default_package_cmd)
-    }
+    prepare_env_cmd = project.get_property(
+        "docker_package_prepare_env_cmd",
+        "echo 'empty prepare_env_cmd installing into python'",
+    ),
+    package_cmd = project.get_property(
+        "docker_package_package_cmd",
+        f"pip install {dist_file}",
+    )
 
-    return DOCKER_IMAGE_TEMPLATE.substitute(template_values)
+    return f"FROM {build_image}\n" \
+           f"MAINTAINER {maintainer}\n" \
+           f"COPY ${dist_file} .\n" \
+           f"RUN ${prepare_env_cmd}\n" \
+           f"RUN ${package_cmd}\n"
 
 
-def get_dist_file(project):
-    default_dist_file = "{name}-{version}.tar.gz".format(name=project.name, version=project.version)
+def get_dist_file(project: Project) -> bool:
+    default_dist_file = f"{project.name}-{project.version}.tar.gz"
+
     return project.get_property("docker_package_dist_file", default_dist_file)
 
 
-def randomWord(param):
-    return ''.join(random.choice(string.lowercase) for i in range(param))
-
-
-def prepare_reports_directory(project):
+def prepare_reports_directory(project: Project) -> str:
     return prepare_directory("$dir_reports", project)
 
 
-def prepare_dist_directory(project):
+def prepare_dist_directory(project: Project) -> str:
     return prepare_directory("$dir_dist", project)
 
 
-def prepare_directory(dir_variable, project):
-    package__format = "{}/docker".format(dir_variable)
-    reports_dir = project.expand_path(package__format)
+def prepare_directory(dir_variable: str, project: Project) -> str:
+    package_format = f"{dir_variable}/docker"
+    reports_dir = project.expand_path(package_format)
     if not os.path.exists(reports_dir):
         os.mkdir(reports_dir)
+
     return reports_dir

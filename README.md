@@ -1,4 +1,7 @@
+**N.B.:** This is a fork of [pybuilder-docker](https://github.com/AlienVault-Engineering/pybuilder-docker) which, as far as I know, is not maintained anymore. Code refactored and minor tweaks.  
+
 # pybuilder-docker
+
 A pybuilder plugin that stages a python package into a docker container and optionally publishes it to a registry.
 
 To have pybuilder build a docker image containing the project's package, add `use_plugin("pypi:pybuilder_docker")` to your build.py file, add a Dockerfile and required resources to the folder `src/main/docker`.

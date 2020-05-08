@@ -84,76 +84,94 @@ def docker_push(project, logger):
     do_docker_push(project, logger)
 
 
-def _ecr_login(project, registry):
-    command = ExternalCommandBuilder('aws', project)
+def do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
+    # True if user set verbose in build.py or from command line
+    verbose = project.get_property("verbose")
+    project.set_property_if_unset("docker_push_verbose_output", verbose)
+
+    registry = project.get_mandatory_property("docker_push_registry")
+
+    fq_artifact = project.get_property("docker_push_img", get_build_img(project))
+    if "ecr" in registry:
+        _prep_ecr(project=project, fq_artifact=fq_artifact, registry=registry)
+
+    local_img = get_build_img(project)
+
+    registry_path = f"{registry}/{fq_artifact}"
+
+    tags = [project.version]
+    tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
+    if tag_as_latest:
+        tags.append('latest')
+    for tag in tags:
+        remote_img = f"{registry_path}:{tag}"
+        _run_tag_cmd(project, logger, reactor, local_img, remote_img)
+        _run_push_cmd(project, logger, reactor, remote_img)
+
+    generate_artifact_manifest(project, logger, reactor, registry_path)
+
+
+def _prep_ecr(project: Project, logger: Logger, reactor: Reactor, registry: str, fq_artifact: str) -> None:
+    _ecr_login(project, logger, reactor, registry)
+    create_ecr_registry = project.get_property("ensure_ecr_registry_created", True)
+    if create_ecr_registry:
+        _create_ecr_registry(project, logger, reactor, fq_artifact)
+
+
+# aws ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken'
+#     | base64 -D
+#     | cut -d: -f2
+# docker login -u AWS -p <my_decoded_password> -e <any_email_address> <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
+def _ecr_login(project: Project, logger: Logger, reactor: Reactor, registry: str) -> None:
+    command = ExternalCommandBuilder('aws', project, reactor)
     command.use_argument('ecr')
     command.use_argument('get-authorization-token')
     command.use_argument('--output')
     command.use_argument('text')
     command.use_argument('--query')
     command.use_argument('authorizationData[].authorizationToken')
-    res = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_get_token'))
-    if res.exit_code > 0:
+    result = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_get_token'))
+    if result.exit_code > 0:
+        logger.info(result.error_report_lines)  # TODO verbose?
+
         raise Exception("Error getting token")
-    pass_token = base64.b64decode(res.report_lines[0])
-    split = pass_token.split(":")
-    command = ExternalCommandBuilder('docker', project)
+
+    pass_token = base64.b64decode(result.report_lines[0])
+    username, password = pass_token.split(":")
+    command = ExternalCommandBuilder('docker', project, reactor)
     command.use_argument('login')
     command.use_argument('-u')
-    command.use_argument('{0}').formatted_with(split[0])
+    command.use_argument('{0}').formatted_with(username)
     command.use_argument('-p')
-    command.use_argument('{0}').formatted_with(split[1])
+    command.use_argument('{0}').formatted_with(password)
     command.use_argument('{0}').formatted_with(registry)
-    res = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_docker_login'))
-    if res.exit_code > 0:
+    result = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_docker_login'))
+    if result.exit_code > 0:
+        logger.info(result.error_report_lines)  # TODO verbose?
+
         raise Exception("Error authenticating")
-        # aws ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken' | base64 -D | cut -d: -f2
-        # docker login -u AWS -p <my_decoded_password> -e <any_email_address> <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com
 
 
-def _prep_ecr(project, fq_artifact, registry):
-    _ecr_login(project, registry)
-    create_ecr_registry = project.get_property("ensure_ecr_registry_created", True)
-    if create_ecr_registry:
-        _create_ecr_registry(fq_artifact, project)
+def _create_ecr_registry(project: Project, logger: Logger, reactor: Reactor, fq_artifact: str) -> None:
+    reports_dir = prepare_reports_directory(project)
 
-
-def _create_ecr_registry(fq_artifact, project):
-    command = ExternalCommandBuilder('aws', project)
+    command = ExternalCommandBuilder('aws', project, reactor)
     command.use_argument('ecr')
     command.use_argument('describe-repositories')
     command.use_argument('--repository-names')
     command.use_argument('{0}').formatted_with(fq_artifact)
-    res = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_registry_discover'))
-    if res.exit_code > 0:
-        command = ExternalCommandBuilder('aws', project)
+    result = command.run(f"{reports_dir}/docker_ecr_registry_discover")
+    if result.exit_code > 0:
+        command = ExternalCommandBuilder('aws', project, reactor)
         command.use_argument('ecr')
         command.use_argument('create-repository')
         command.use_argument('--repository-name')
         command.use_argument('{0}').formatted_with(fq_artifact)
-        res = command.run("{}/{}".format(prepare_reports_directory(project), 'docker_ecr_registry_create'))
-        if res.exit_code > 0:
+        result = command.run(f"{reports_dir}/docker_ecr_registry_create")
+        if result.exit_code > 0:
+            logger.info(result.error_report_lines)  # TODO verbose?
+
             raise Exception("Unable to create ecr registry")
-
-
-def do_docker_push(project, logger):
-    # type: (Project, Logger) -> None
-    verbose = project.get_property("verbose")
-    project.set_property_if_unset("docker_push_verbose_output", verbose)
-    tag_as_latest = project.get_property("docker_push_tag_as_latest", True)
-    registry = project.get_mandatory_property("docker_push_registry")
-    local_img = get_build_img(project)
-    fq_artifact = project.get_property("docker_push_img", get_build_img(project))
-    if "ecr" in registry:
-        _prep_ecr(project=project, fq_artifact=fq_artifact, registry=registry)
-    registry_path = "{registry}/{fq_artifact}".format(registry=registry, fq_artifact=fq_artifact, )
-    tags = [project.version]
-    if tag_as_latest: tags.append('latest')
-    for tag in tags:
-        remote_img = "{registry_path}:{version}".format(registry_path=registry_path, version=tag)
-        _run_tag_cmd(project, local_img, remote_img, logger)
-        _run_push_cmd(project=project, remote_img=remote_img, logger=logger)
-    generate_artifact_manifest(project, registry_path)
 
 
 def generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
@@ -179,7 +197,7 @@ def _run_tag_cmd(project: Project, logger: Logger, reactor: Reactor, local_img: 
     logger.info("Tagging local docker image {} - {}".format(local_img, remote_img))
     result = command.run(f"{report_dir}/docker_push_tag")
     if result.exit_code > 0:
-        logger.info(result.error_report_lines)
+        logger.info(result.error_report_lines)  # TODO verbose?
 
         raise Exception(f"Error tagging image to remote registry - {remote_img}")
 
@@ -195,7 +213,7 @@ def _run_push_cmd(project: Project, logger: Logger, reactor: Reactor, remote_img
     logger.info("Pushing remote docker image - {}".format(remote_img))
     result = command.run(f"{report_dir}/docker_push_tag")
     if result.exit_code > 0:
-        logger.info(result.error_report_lines)
+        logger.info(result.error_report_lines)  # TODO verbose?
 
         raise Exception(f"Error pushing image to remote registry - {remote_img}")
 

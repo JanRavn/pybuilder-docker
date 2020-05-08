@@ -1,11 +1,7 @@
 import os
 import unittest
 
-import pybuilder_docker
-
 DIRNAME = os.path.dirname(os.path.abspath(__file__))
-
-
 
 
 class PybuildDockerTestCase(unittest.TestCase):

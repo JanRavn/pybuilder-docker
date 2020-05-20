@@ -55,6 +55,20 @@ def docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
     do_docker_package(project, logger, reactor)
 
 
+def __get_source_docker_image(project: Project) -> str:
+    """Get the Docker name for consisting of an image:tag"""
+    build_img = project.get_property("docker_package_build_img", f"{project.name}")
+    build_tag = project.get_property("docker_package_build_version", f"{project.version}")
+    return f"{build_img}:{build_tag}"
+
+def __get_target_docker_image(project: Project, tag: str) -> str:
+    """Get the Target docker name. This can be explicitly set using the docker_push_img property"""
+    source_build_img = project.get_property("docker_package_build_img", f"{project.name}")
+    target_build_img = project.get_property("docker_push_img", source_build_img)
+    registry = project.get_mandatory_property("docker_push_registry")
+    return f"{registry}/{target_build_img}:{tag}"
+
+
 @after("publish")
 def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_package_build_dir", "src/main/docker")
@@ -66,9 +80,9 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
         command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
 
     dist_dir = _make_folder(project, "$dir_dist", "docker")
-    build_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
-    _docker_build_stages(project, logger, reactor, dist_dir, build_img)
-    logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
+    docker_name = __get_source_docker_image(project)
+    _docker_build_stages(project, logger, reactor, dist_dir, docker_name)
+    logger.info(f"Finished build docker image - {docker_name} - with dist file - {dist_dir}")
 
 
 # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
@@ -132,12 +146,12 @@ def _do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_push_verbose_output", project.get_property("verbose"))
 
     registry = project.get_mandatory_property("docker_push_registry")
-    local_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
-    fq_artifact = project.get_property("docker_push_img", local_img)
-    registry_path = f"{registry}/{fq_artifact}"
+    source_docker_name = __get_source_docker_image(project)
+    fq_artifact = project.get_property("docker_push_img", source_docker_name)
+    registry_path = __get_target_docker_image(project, tag=project.get_property("docker_package_build_version", f"{project.version}"))
 
     _docker_login_aws_ecr(project, logger, reactor, registry, fq_artifact)
-    _docker_tag_and_push_image(project, logger, reactor, local_img)
+    _docker_tag_and_push_image(project, logger, reactor, source_docker_name)
     _generate_artifact_manifest(project, logger, reactor, registry_path)
 
 
@@ -188,7 +202,7 @@ def _docker_tag_and_push_image(project: Project, logger: Logger, reactor: Reacto
     if tag_as_latest:
         tags.append('latest')
     for tag in tags:
-        remote_img = f"{project.name}:{tag}"
+        remote_img = __get_target_docker_image(project, tag)
         _exec_cmd(
             project, logger, reactor,
             'docker', 'tag', local_img, remote_img,

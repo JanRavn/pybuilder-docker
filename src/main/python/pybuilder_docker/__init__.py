@@ -13,6 +13,7 @@ from pybuilder.pluginhelper.external_command import ExternalCommandBuilder
 from pybuilder.pluginhelper.external_command import ExternalCommandResult
 from pybuilder.reactor import Reactor
 
+from pathlib import Path
 
 def _exec_cmd(
         project: Project, logger: Logger, reactor: Reactor,
@@ -54,6 +55,20 @@ def docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
     do_docker_package(project, logger, reactor)
 
 
+def __get_source_docker_image(project: Project) -> str:
+    """Get the Docker name for consisting of an image:tag"""
+    build_img = project.get_property("docker_package_build_img", f"{project.name}")
+    build_tag = project.get_property("docker_package_build_version", f"{project.version}")
+    return f"{build_img}:{build_tag}"
+
+def __get_target_docker_image(project: Project, tag: str) -> str:
+    """Get the Target docker name. This can be explicitly set using the docker_push_img property"""
+    source_build_img = project.get_property("docker_package_build_img", f"{project.name}")
+    target_build_img = project.get_property("docker_push_img", source_build_img)
+    registry = project.get_mandatory_property("docker_push_registry")
+    return f"{registry}/{target_build_img}:{tag}"
+
+
 @after("publish")
 def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_package_build_dir", "src/main/docker")
@@ -65,9 +80,9 @@ def do_docker_package(project: Project, logger: Logger, reactor: Reactor) -> Non
         command_and_arguments=["docker", "--version"], prerequisite="docker", caller="docker_package")
 
     dist_dir = _make_folder(project, "$dir_dist", "docker")
-    build_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
-    _docker_build_stages(project, logger, reactor, dist_dir, build_img)
-    logger.info(f"Finished build docker image - {build_img} - with dist file - {dist_dir}")
+    docker_name = __get_source_docker_image(project)
+    _docker_build_stages(project, logger, reactor, dist_dir, docker_name)
+    logger.info(f"Finished build docker image - {docker_name} - with dist file - {dist_dir}")
 
 
 # docker build --build-arg buildVersion=${BUILD_NUMBER} -t ${BUILD_IMG} src/
@@ -99,24 +114,25 @@ def _docker_build_stages(project: Project, logger: Logger, reactor: Reactor, dis
 def _generate_dockerfile(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
     dist_file = project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
     prepare_env_cmd = project.get_property("docker_package_prepare_env_cmd",
-                                           "echo 'empty prepare_env_cmd installing into python'"),
+                                           "echo 'empty prepare_env_cmd installing into python'")
     package_cmd = project.get_property("docker_package_package_cmd", f"pip install {dist_file}")
 
     setup_script = os.path.join(dist_dir, "Dockerfile")
+    logger.debug(f"Prepare Env CMD: {prepare_env_cmd}")
+    logger.debug(f"Package CMD: {package_cmd}")
     with open(setup_script, "w") as setup_file:
         setup_file.write(f"FROM pyb-temp-{project.name}:{project.version}\n"
                          f"MAINTAINER {project.get_property('docker_package_image_maintainer', 'anonymous')}\n"
-                         f"COPY ${dist_file} .\n"
-                         f"RUN ${prepare_env_cmd}\n"
-                         f"RUN ${package_cmd}\n")
+                         f"COPY {dist_file} .\n"
+                         f"RUN {prepare_env_cmd}\n"
+                         f"RUN {package_cmd}\n")
     os.chmod(setup_script, 0o755)
 
 
 def _copy_dist_package(project: Project, logger: Logger, reactor: Reactor, dist_dir: str) -> None:
-    dist_file_path = project.expand_path(
-        _make_folder(project, "$dir_dist", 'dist'),
-        project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
-    )
+    dist_file_path = Path(_make_folder(project, "$dir_dist", 'dist')) / project.get_property("docker_package_dist_file", f"{project.name}-{project.version}.tar.gz")
+    logger.debug(f"Dist file path {dist_file_path}")
+    logger.debug(f"Copying to: {dist_dir}")
     shutil.copy2(dist_file_path, dist_dir)
 
 
@@ -130,12 +146,12 @@ def _do_docker_push(project: Project, logger: Logger, reactor: Reactor) -> None:
     project.set_property_if_unset("docker_push_verbose_output", project.get_property("verbose"))
 
     registry = project.get_mandatory_property("docker_push_registry")
-    local_img = project.get_property("docker_package_build_img", f"{project.name}:{project.version}")
-    fq_artifact = project.get_property("docker_push_img", local_img)
-    registry_path = f"{registry}/{fq_artifact}"
+    source_docker_name = __get_source_docker_image(project)
+    fq_artifact = project.get_property("docker_push_img", source_docker_name)
+    registry_path = __get_target_docker_image(project, tag=project.get_property("docker_package_build_version", f"{project.version}"))
 
     _docker_login_aws_ecr(project, logger, reactor, registry, fq_artifact)
-    _docker_tag_and_push_image(project, logger, reactor, local_img)
+    _docker_tag_and_push_image(project, logger, reactor, source_docker_name)
     _generate_artifact_manifest(project, logger, reactor, registry_path)
 
 
@@ -186,7 +202,7 @@ def _docker_tag_and_push_image(project: Project, logger: Logger, reactor: Reacto
     if tag_as_latest:
         tags.append('latest')
     for tag in tags:
-        remote_img = f"{project.name}:{tag}"
+        remote_img = __get_target_docker_image(project, tag)
         _exec_cmd(
             project, logger, reactor,
             'docker', 'tag', local_img, remote_img,
@@ -207,7 +223,7 @@ def _docker_tag_and_push_image(project: Project, logger: Logger, reactor: Reacto
 
 
 def _generate_artifact_manifest(project: Project, logger: Logger, reactor: Reactor, registry_path: str) -> None:
-    artifact_path = project.expand_path(_make_folder(project, '$dir_target'), 'artifact.json')
+    artifact_path = Path(_make_folder(project, '$dir_target')) / 'artifact.json'
     with open(artifact_path, 'w') as target:
         artifact_manifest = {
             'artifact-type': 'container',
